@@ -3,7 +3,7 @@
 # tagdock
 
 [![CI](https://github.com/VincentBorgers/tagdock/actions/workflows/ci.yml/badge.svg)](https://github.com/VincentBorgers/tagdock/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/VincentBorgers/tagdock)](LICENSE)
+[![License](https://img.shields.io/github/license/VincentBorgers/tagdock?color=blue)](LICENSE)
 [![Buy me a coffee](https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/vincentborgers)
 
 Run server-side Google Tag Manager on your own server with Docker Compose.
