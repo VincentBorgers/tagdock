@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+#
+# tagdock - run server-side Google Tag Manager on your own server.
+#
+# Usage: ./tagdock <command> [arguments]
+# Run ./tagdock help for the list of commands.
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CONFIG_FILE=${TAGDOCK_CONFIG:-$ROOT/tagdock.env}
+SITES_DIR=${TAGDOCK_SITES_DIR:-$ROOT/sites}
+OUT_DIR=${TAGDOCK_OUT_DIR:-$ROOT/.generated}
+TEMPLATE_FILE=$ROOT/sites/example.env.template
+
+DEFAULT_IMAGE=gcr.io/cloud-tagging-10302018/gtm-cloud-image:stable
+DEFAULT_CADDY_IMAGE=caddy:2
+
+die() {
+  printf 'tagdock: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'tagdock: warning: %s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./tagdock <command> [arguments]
+
+Commands:
+  add <site> [--template]
+                         Create sites/<site>.env. Asks for the values, or copies
+                         the template when --template is given
+  check                  Validate tagdock.env and every site file
+  render                 Write .generated/compose.yaml (and Caddyfile)
+  up                     Validate, render and start or update all containers
+  status                 Show the state and health of every container
+  update                 Pull the latest images and recreate changed containers
+  heal                   Restart containers that Docker reports as unhealthy
+  logs <site> [tagging|preview]
+                         Follow the logs of a site
+  down                   Stop and remove all containers
+  help                   Show this help
+EOF
+}
+
+# Reads KEY=VALUE lines from a file into variables prefixed with $2.
+# Lines that are empty or start with # are skipped. Values are taken
+# literally, so nothing in the file is executed.
+read_env_file() {
+  local file=$1 prefix=$2 line key value lineno=0
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    lineno=$((lineno + 1))
+    line=${line%$'\r'}
+    [[ -z ${line//[[:space:]]/} || $line =~ ^[[:space:]]*# ]] && continue
+
+    if [[ ! $line =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
+      die "$file:$lineno: expected KEY=VALUE"
+    fi
+
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+
+    if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+      value=${BASH_REMATCH[1]}
+    fi
+
+    printf -v "${prefix}${key}" '%s' "$value"
+  done <"$file"
+}
+
+load_config() {
+  [[ -f $CONFIG_FILE ]] || die "$CONFIG_FILE not found. Copy tagdock.env.example to tagdock.env first."
+
+  read_env_file "$CONFIG_FILE" CFG_
+
+  PROXY=${CFG_PROXY:-caddy}
+  IMAGE=${CFG_SGTM_IMAGE:-$DEFAULT_IMAGE}
+  CADDY_IMAGE=${CFG_CADDY_IMAGE:-$DEFAULT_CADDY_IMAGE}
+  ACME_EMAIL=${CFG_ACME_EMAIL:-}
+  HTTP_PORT=${CFG_HTTP_PORT:-80}
+  HTTPS_PORT=${CFG_HTTPS_PORT:-443}
+  CADDY_LOCAL_CERTS=${CFG_CADDY_LOCAL_CERTS:-false}
+  PROJECT=${CFG_COMPOSE_PROJECT:-tagdock}
+
+  case $PROXY in
+    caddy) LISTEN_ADDRESS=${CFG_LISTEN_ADDRESS:-} ;;
+    none) LISTEN_ADDRESS=${CFG_LISTEN_ADDRESS:-127.0.0.1} ;;
+    *) die "$CONFIG_FILE: PROXY must be caddy or none, not '$PROXY'" ;;
+  esac
+
+  [[ $PROJECT =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "$CONFIG_FILE: COMPOSE_PROJECT may only contain a-z, 0-9, - and _"
+  [[ $CADDY_LOCAL_CERTS == true || $CADDY_LOCAL_CERTS == false ]] || die "$CONFIG_FILE: CADDY_LOCAL_CERTS must be true or false"
+  is_port "$HTTP_PORT" || die "$CONFIG_FILE: HTTP_PORT is not a valid port"
+  is_port "$HTTPS_PORT" || die "$CONFIG_FILE: HTTPS_PORT is not a valid port"
+}
+
+is_port() {
+  [[ $1 =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+is_domain() {
+  [[ $1 =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$ ]]
+}
+
+is_memory() {
+  [[ $1 =~ ^[0-9]+[kmg]$ ]]
+}
+
+site_names() {
+  local file name
+
+  shopt -s nullglob
+  for file in "$SITES_DIR"/*.env; do
+    name=$(basename "$file" .env)
+    printf '%s\n' "$name"
+  done
+  shopt -u nullglob
+}
+
+# Decodes the container config and prints the GTM container id, or nothing
+# when the value does not look like a server container config.
+container_id() {
+  local decoded
+
+  decoded=$(printf '%s' "$1" | base64 -d 2>/dev/null | tr -d '\0') || return 0
+  [[ $decoded =~ (^|&)id=(GTM-[A-Z0-9]+)(&|$) ]] && printf '%s' "${BASH_REMATCH[2]}"
+  return 0
+}
+
+# Loads sites/<name>.env into SITE_* variables and validates it.
+load_site() {
+  local name=$1 file=$SITES_DIR/$1.env var
+
+  for var in "${!SITE_@}"; do
+    unset "$var"
+  done
+
+  [[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "$file: site names may only contain a-z, 0-9 and -"
+  read_env_file "$file" SITE_
+
+  SITE_NAME=$name
+  SITE_TAGGING_MEMORY=${SITE_TAGGING_MEMORY:-1g}
+  SITE_PREVIEW_MEMORY=${SITE_PREVIEW_MEMORY:-512m}
+
+  [[ -n ${SITE_CONTAINER_CONFIG:-} ]] || die "$file: CONTAINER_CONFIG is empty"
+  SITE_CONTAINER_ID=$(container_id "$SITE_CONTAINER_CONFIG")
+  [[ -n $SITE_CONTAINER_ID ]] || die "$file: CONTAINER_CONFIG is not a server container config (it should decode to id=GTM-...)"
+
+  [[ -n ${SITE_PREVIEW_DOMAIN:-} ]] || die "$file: PREVIEW_DOMAIN is empty"
+  is_domain "$SITE_PREVIEW_DOMAIN" || die "$file: PREVIEW_DOMAIN '$SITE_PREVIEW_DOMAIN' is not a valid domain"
+
+  if [[ $PROXY == caddy ]]; then
+    [[ -n ${SITE_TAGGING_DOMAIN:-} ]] || die "$file: TAGGING_DOMAIN is empty"
+    is_domain "$SITE_TAGGING_DOMAIN" || die "$file: TAGGING_DOMAIN '$SITE_TAGGING_DOMAIN' is not a valid domain"
+    [[ $SITE_TAGGING_DOMAIN != "$SITE_PREVIEW_DOMAIN" ]] || die "$file: TAGGING_DOMAIN and PREVIEW_DOMAIN must be different"
+  else
+    is_port "${SITE_TAGGING_PORT:-}" || die "$file: TAGGING_PORT is not a valid port"
+    is_port "${SITE_PREVIEW_PORT:-}" || die "$file: PREVIEW_PORT is not a valid port"
+  fi
+
+  is_memory "$SITE_TAGGING_MEMORY" || die "$file: TAGGING_MEMORY must look like 512m or 1g"
+  is_memory "$SITE_PREVIEW_MEMORY" || die "$file: PREVIEW_MEMORY must look like 512m or 1g"
+}
+
+# Lowercases a domain and strips a scheme, path or trailing dot, so that
+# "https://SGTM.example.com/" becomes "sgtm.example.com".
+normalize_domain() {
+  local domain=${1,,}
+
+  domain=${domain#http://}
+  domain=${domain#https://}
+  domain=${domain%%/*}
+  printf '%s' "${domain%.}"
+}
+
+local_addresses() {
+  if command -v ip >/dev/null; then
+    ip -o addr show scope global 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'
+  elif command -v hostname >/dev/null; then
+    hostname -I 2>/dev/null | tr ' ' '\n'
+  fi
+}
+
+# Warns about domains that do not resolve, or that resolve only to addresses
+# this server does not have. It never fails, because Cloudflare's proxy or a NAT
+# gateway in front of the server are valid reasons for a different address.
+check_dns() {
+  local domain resolved local_ips address found
+
+  command -v getent >/dev/null || return 0
+  local_ips=$(local_addresses)
+
+  for domain in "$@"; do
+    resolved=$(getent ahosts "$domain" 2>/dev/null | awk '{ print $1 }' | sort -u) || true
+
+    if [[ -z $resolved ]]; then
+      warn "$domain does not resolve. Add a DNS record that points to this server."
+      continue
+    fi
+
+    [[ -n $local_ips ]] || continue
+
+    found=false
+    for address in $resolved; do
+      if grep -qxF "$address" <<<"$local_ips"; then
+        found=true
+        break
+      fi
+    done
+
+    if [[ $found == false ]]; then
+      warn "$domain points to $(paste -sd ' ' <<<"$resolved"), which is not an address of this server. Ignore this if a proxy such as Cloudflare is in front of it."
+    fi
+  done
+}
+
+check_all() {
+  local name names=() domains=() seen_domains=" " seen_ports=" " value
+
+  mapfile -t names < <(site_names)
+  ((${#names[@]} > 0)) || die "no sites found in $SITES_DIR. Add one with ./tagdock add <site>."
+
+  for name in "${names[@]}"; do
+    load_site "$name"
+
+    domains=("$SITE_PREVIEW_DOMAIN")
+    [[ $PROXY == none ]] || domains+=("$SITE_TAGGING_DOMAIN")
+
+    for value in "${domains[@]}"; do
+      [[ $seen_domains != *" $value "* ]] || die "$value is used by more than one site"
+      seen_domains+="$value "
+    done
+
+    if [[ $PROXY == none ]]; then
+      for value in "$SITE_TAGGING_PORT" "$SITE_PREVIEW_PORT"; do
+        [[ $seen_ports != *" $value "* ]] || die "port $value is used more than once"
+        seen_ports+="$value "
+      done
+    fi
+  done
+
+  SITES=("${names[@]}")
+  read -ra DNS_DOMAINS <<<"$seen_domains"
+}
+
+render_service() {
+  local role=$1 memory=$2 port=$3
+
+  cat <<EOF
+  ${SITE_NAME}-${role}:
+    image: ${IMAGE}
+    restart: unless-stopped
+    env_file:
+      - ${SITES_DIR}/${SITE_NAME}.env
+    environment:
+EOF
+
+  if [[ $role == preview ]]; then
+    printf '      RUN_AS_PREVIEW_SERVER: "true"\n'
+  else
+    printf '      PREVIEW_SERVER_URL: https://%s\n' "$SITE_PREVIEW_DOMAIN"
+  fi
+
+  cat <<EOF
+    mem_limit: ${memory}
+    labels:
+      io.github.tagdock.site: ${SITE_NAME}
+      io.github.tagdock.role: ${role}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+EOF
+
+  if [[ $PROXY == none ]]; then
+    cat <<EOF
+    ports:
+      - "${LISTEN_ADDRESS}:${port}:8080"
+EOF
+  fi
+}
+
+port_mapping() {
+  if [[ -n $LISTEN_ADDRESS ]]; then
+    printf '"%s:%s:%s"' "$LISTEN_ADDRESS" "$1" "$2"
+  else
+    printf '"%s:%s"' "$1" "$2"
+  fi
+}
+
+render_compose() {
+  local name
+
+  printf '# Generated by ./tagdock render. Edit tagdock.env and sites/*.env instead.\n'
+  printf 'name: %s\n\nservices:\n' "$PROJECT"
+
+  for name in "${SITES[@]}"; do
+    load_site "$name"
+    render_service preview "$SITE_PREVIEW_MEMORY" "${SITE_PREVIEW_PORT:-}"
+    printf '\n'
+    render_service tagging "$SITE_TAGGING_MEMORY" "${SITE_TAGGING_PORT:-}"
+    printf '\n'
+  done
+
+  if [[ $PROXY == caddy ]]; then
+    cat <<EOF
+  caddy:
+    image: ${CADDY_IMAGE}
+    restart: unless-stopped
+    ports:
+      - $(port_mapping "$HTTP_PORT" 80)
+      - $(port_mapping "$HTTPS_PORT" 443)
+      - $(port_mapping "$HTTPS_PORT" 443/udp)
+    volumes:
+      - ${OUT_DIR}:/etc/caddy:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:
+EOF
+  fi
+}
+
+render_caddyfile() {
+  local name
+
+  printf '# Generated by ./tagdock render. Edit tagdock.env and sites/*.env instead.\n'
+
+  if [[ -n $ACME_EMAIL || $CADDY_LOCAL_CERTS == true ]]; then
+    printf '{\n'
+    [[ -z $ACME_EMAIL ]] || printf '\temail %s\n' "$ACME_EMAIL"
+    [[ $CADDY_LOCAL_CERTS != true ]] || printf '\tlocal_certs\n'
+    printf '}\n'
+  fi
+
+  for name in "${SITES[@]}"; do
+    load_site "$name"
+    printf '\n%s {\n\treverse_proxy %s-tagging:8080\n}\n' "$SITE_TAGGING_DOMAIN" "$SITE_NAME"
+    printf '\n%s {\n\treverse_proxy %s-preview:8080\n}\n' "$SITE_PREVIEW_DOMAIN" "$SITE_NAME"
+  done
+}
+
+write_file() {
+  local target=$1 content=$2
+
+  printf '%s\n' "$content" >"$target"
+}
+
+cmd_render() {
+  load_config
+  check_all
+  mkdir -p "$OUT_DIR"
+
+  write_file "$OUT_DIR/compose.yaml" "$(render_compose)"
+
+  if [[ $PROXY == caddy ]]; then
+    write_file "$OUT_DIR/Caddyfile" "$(render_caddyfile)"
+  else
+    rm -f "$OUT_DIR/Caddyfile"
+  fi
+}
+
+compose() {
+  docker compose --project-name "$PROJECT" --file "$OUT_DIR/compose.yaml" "$@"
+}
+
+require_docker() {
+  command -v docker >/dev/null || die "docker is not installed"
+  docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not installed"
+}
+
+# Settings answered during ./tagdock add, keyed by setting name.
+declare -A ANSWERS=()
+
+ask() {
+  local question=$1
+
+  printf '%s: ' "$question" >&2
+  IFS= read -r REPLY || die "no answer on stdin. Use ./tagdock add <site> --template to create the file without questions."
+  REPLY=${REPLY%$'\r'}
+  REPLY=${REPLY#"${REPLY%%[![:space:]]*}"}
+  REPLY=${REPLY%"${REPLY##*[![:space:]]}"}
+}
+
+# Prints the domains and ports of the existing site files, separated by spaces.
+used_values() {
+  local name var
+
+  for name in $(site_names); do
+    for var in "${!USED_@}"; do
+      unset "$var"
+    done
+    read_env_file "$SITES_DIR/$name.env" USED_
+    printf ' %s %s %s %s' "${USED_TAGGING_DOMAIN:-}" "${USED_PREVIEW_DOMAIN:-}" "${USED_TAGGING_PORT:-}" "${USED_PREVIEW_PORT:-}"
+  done
+  printf ' '
+}
+
+ask_domain() {
+  local key=$1 question=$2 used=$3 domain
+
+  while :; do
+    ask "$question"
+    domain=$(normalize_domain "$REPLY")
+
+    if ! is_domain "$domain"; then
+      warn "'$REPLY' is not a valid domain"
+    elif [[ $used == *" $domain "* ]]; then
+      warn "$domain is already used"
+    else
+      ANSWERS[$key]=$domain
+      return
+    fi
+  done
+}
+
+ask_port() {
+  local key=$1 question=$2 used=$3
+
+  while :; do
+    ask "$question"
+
+    if ! is_port "$REPLY"; then
+      warn "'$REPLY' is not a valid port"
+    elif [[ $used == *" $((10#$REPLY)) "* ]]; then
+      warn "port $REPLY is already used"
+    else
+      ANSWERS[$key]=$((10#$REPLY))
+      return
+    fi
+  done
+}
+
+# Prints the template with the answered settings filled in.
+fill_template() {
+  local line
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^([A-Z][A-Z0-9_]*)=$ && -n ${ANSWERS[${BASH_REMATCH[1]}]:-} ]]; then
+      printf '%s=%s\n' "${BASH_REMATCH[1]}" "${ANSWERS[${BASH_REMATCH[1]}]}"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <"$TEMPLATE_FILE"
+}
+
+cmd_add() {
+  local name=${1:-} option=${2:-} file id used
+
+  [[ -n $name ]] || die "usage: ./tagdock add <site> [--template]"
+  [[ -z $option || $option == --template ]] || die "unknown option $option"
+  [[ $name =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "site names may only contain a-z, 0-9 and -"
+
+  file=$SITES_DIR/$name.env
+  [[ ! -e $file ]] || die "$file already exists"
+  mkdir -p "$SITES_DIR"
+
+  if [[ $option == --template ]]; then
+    (umask 077 && cp "$TEMPLATE_FILE" "$file")
+    info "Created $file"
+    info "Fill in CONTAINER_CONFIG and the domains, then run ./tagdock up"
+    return
+  fi
+
+  load_config
+  used=$(used_values)
+
+  while :; do
+    ask "Container Config (in Tag Manager: container ID > Manually provision tagging server)"
+    id=$(container_id "$REPLY")
+    [[ -n $id ]] && break
+    warn "this is not a server container config. It should decode to id=GTM-..."
+  done
+  ANSWERS[CONTAINER_CONFIG]=$REPLY
+  info "Server container $id"
+
+  if [[ $PROXY == caddy ]]; then
+    ask_domain TAGGING_DOMAIN "Tagging domain, for example sgtm.example.com" "$used"
+    ask_domain PREVIEW_DOMAIN "Preview domain, for example sgtm-preview.example.com" "$used${ANSWERS[TAGGING_DOMAIN]} "
+  else
+    ask_domain PREVIEW_DOMAIN "Preview domain, for example sgtm-preview.example.com" "$used"
+    ask_port TAGGING_PORT "Port for the tagging server, for example 18080" "$used"
+    ask_port PREVIEW_PORT "Port for the preview server, for example 18081" "$used${ANSWERS[TAGGING_PORT]} "
+  fi
+
+  (umask 077 && fill_template >"$file")
+  info "Created $file"
+
+  if [[ $PROXY == caddy ]]; then
+    check_dns "${ANSWERS[TAGGING_DOMAIN]}" "${ANSWERS[PREVIEW_DOMAIN]}"
+  else
+    check_dns "${ANSWERS[PREVIEW_DOMAIN]}"
+  fi
+
+  info "Run ./tagdock up to start it."
+}
+
+cmd_check() {
+  local name
+
+  load_config
+  check_all
+  check_dns "${DNS_DOMAINS[@]}"
+
+  for name in "${SITES[@]}"; do
+    load_site "$name"
+    if [[ $PROXY == caddy ]]; then
+      info "$name: $SITE_CONTAINER_ID, tagging https://$SITE_TAGGING_DOMAIN, preview https://$SITE_PREVIEW_DOMAIN"
+    else
+      info "$name: $SITE_CONTAINER_ID, tagging $LISTEN_ADDRESS:$SITE_TAGGING_PORT, preview $LISTEN_ADDRESS:$SITE_PREVIEW_PORT (https://$SITE_PREVIEW_DOMAIN)"
+    fi
+  done
+}
+
+cmd_up() {
+  require_docker
+  cmd_render
+  check_dns "${DNS_DOMAINS[@]}"
+  compose up --detach --remove-orphans
+
+  if [[ $PROXY == caddy ]]; then
+    compose exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+  fi
+
+  cmd_status
+}
+
+cmd_status() {
+  require_docker
+  load_config
+  [[ -f $OUT_DIR/compose.yaml ]] || die "nothing to show yet. Run ./tagdock up first."
+  compose ps --all --format 'table {{.Service}}\t{{.State}}\t{{.Status}}'
+}
+
+cmd_update() {
+  require_docker
+  cmd_render
+  compose pull
+  compose up --detach --remove-orphans
+  cmd_status
+}
+
+cmd_heal() {
+  local id ids name
+
+  require_docker
+  load_config
+
+  ids=$(docker ps --quiet --filter "label=com.docker.compose.project=$PROJECT" --filter health=unhealthy)
+
+  if [[ -z $ids ]]; then
+    info "all containers are healthy"
+    return 0
+  fi
+
+  for id in $ids; do
+    name=$(docker inspect --format '{{.Name}}' "$id")
+    info "restarting ${name#/} (unhealthy)"
+    docker restart "$id" >/dev/null
+  done
+}
+
+cmd_logs() {
+  local name=${1:-} role=${2:-tagging}
+
+  [[ -n $name ]] || die "usage: ./tagdock logs <site> [tagging|preview]"
+  [[ $role == tagging || $role == preview ]] || die "role must be tagging or preview"
+
+  require_docker
+  load_config
+  compose logs --follow --tail 100 "$name-$role"
+}
+
+cmd_down() {
+  require_docker
+  load_config
+  [[ -f $OUT_DIR/compose.yaml ]] || die "nothing to stop. Run ./tagdock up first."
+  compose down --remove-orphans
+}
+
+main() {
+  local command=${1:-help}
+
+  shift || true
+
+  case $command in
+    add) cmd_add "$@" ;;
+    check) cmd_check ;;
+    render) cmd_render && info "Wrote $OUT_DIR" ;;
+    up) cmd_up ;;
+    status) cmd_status ;;
+    update) cmd_update ;;
+    heal) cmd_heal ;;
+    logs) cmd_logs "$@" ;;
+    down) cmd_down ;;
+    help | -h | --help) usage ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
