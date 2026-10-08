@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  high_level_summary: true
+  sequence_diagrams: false
+  poem: false
+  in_progress_fortune: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: tagdock
+      instructions: >-
+        Bash 4 script that may only depend on coreutils and Docker. Values read from
+        tagdock.env and sites/*.env must never be executed, and CONTAINER_CONFIG must never
+        end up in .generated/. A new option or command needs a test in tests/tagdock.bats
+        and a mention in README.md.
+    - path: tests/**
+      instructions: >-
+        Bats tests. A negative assertion has to use `run !`, because a plain `!` does not
+        fail a bats test unless it is the last command.
+    - path: docs/**
+      instructions: >-
+        Check that commands and configuration in the docs match what the tagdock script
+        accepts and generates.
+  tools:
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    gitleaks:
+      enabled: true
+chat:
+  auto_reply: true

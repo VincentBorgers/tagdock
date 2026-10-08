@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Tagging server behaviour
+    url: https://developers.google.com/tag-platform/tag-manager/server-side
+    about: Questions about tags, clients and the tagging server itself are answered in Google's documentation.

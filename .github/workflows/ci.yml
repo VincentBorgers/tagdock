@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck -x tagdock tests/tagdock.bats
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker run --rm -v "$PWD:/code" -w /code bats/bats:latest tests
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Render both proxy modes and validate them with docker compose
+        run: |
+          config=$(printf 'id=GTM-TEST123&env=1&auth=dGVzdA' | base64)
+          ./tagdock add shop --template
+          sed -i "s|^CONTAINER_CONFIG=.*|CONTAINER_CONFIG=$config|; s|^TAGGING_DOMAIN=.*|TAGGING_DOMAIN=sgtm.example.com|; s|^PREVIEW_DOMAIN=.*|PREVIEW_DOMAIN=sgtm-preview.example.com|; s|^TAGGING_PORT=.*|TAGGING_PORT=18080|; s|^PREVIEW_PORT=.*|PREVIEW_PORT=18081|" sites/shop.env
+
+          cp tagdock.env.example tagdock.env
+          ./tagdock render
+          docker compose -f .generated/compose.yaml config --quiet
+          docker run --rm -v "$PWD/.generated:/etc/caddy:ro" caddy:2 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+          sed -i 's/^PROXY=.*/PROXY=none/' tagdock.env
+          ./tagdock render
+          docker compose -f .generated/compose.yaml config --quiet
