@@ -31,7 +31,7 @@ cp tagdock.env.example tagdock.env
 ./tagdock up
 ```
 
-`./tagdock add` asks for the Container Config and both domains, and warns when a domain does not point to the server yet. After `./tagdock up`, `https://sgtm.example.com/healthy` should return `ok`.
+`./tagdock add` asks for the Container Config and both domains, and warns when a domain does not point to the server yet. After `./tagdock up`, `./tagdock status` should show both containers as healthy and `https://sgtm.example.com/healthy` should return `ok`.
 
 ## Connect Tag Manager
 
